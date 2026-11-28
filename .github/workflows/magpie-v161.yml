@@ -1,0 +1,145 @@
+name: Magpie V161 hosted qualification
+on:
+  push:
+    branches: [magpie-v161-engineering-test]
+    paths: ['.github/workflows/magpie-v161.yml']
+permissions:
+  contents: read
+concurrency:
+  group: magpie-v161-single-fixture
+  cancel-in-progress: false
+jobs:
+  qualification:
+    if: github.run_attempt == 1
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Verify pinned release and run one synthetic free-provider request
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = @'
+          import os, sys, json, time, hashlib, subprocess, urllib.request, urllib.error, pathlib, tempfile, re, ast
+          def emit(stage, **kw):
+              print(json.dumps({"stage":stage, **kw}, sort_keys=True), flush=True)
+          def need(v, msg):
+              if not v: raise RuntimeError(msg)
+          need(os.environ.get("GITHUB_RUN_ATTEMPT")=="1","no rerun of an inference attempt")
+          need(os.environ.get("RUNNER_ENVIRONMENT")=="github-hosted","hosted runner only")
+          root=pathlib.Path(tempfile.mkdtemp(prefix="magpie-qualification-"))
+          bin=root/"magpie.exe"
+          url="https://github.com/yetone/magpie-releases/releases/download/v0.1.4985/magpie-windows-amd64.exe"
+          digest="17452498a0f89ac27bb3722db69913bebcaf70ec58a3522bb148752613e78e2c"
+          with urllib.request.urlopen(url,timeout=60) as r, bin.open("xb") as f:
+              while True:
+                  b=r.read(1024*1024)
+                  if not b: break
+                  f.write(b)
+                  need(f.tell()<=114382336,"asset size exceeded")
+          need(bin.stat().st_size==114382336,"asset size mismatch")
+          need(hashlib.file_digest(bin.open("rb"),"sha256").hexdigest()==digest,"asset digest mismatch")
+          emit("binary_verified",sha256=digest)
+          (root/".portable").touch()
+          data=root/"data"; data.mkdir()
+          model="kilo/kilo-auto/free"
+          provider={"id":"kilo","name":"Kilo Gateway","preset":"kilo","chat":"https://api.kilo.ai/api/openrouter","key":"","models":["kilo-auto/free"],"listOff":True}
+          (data/"providers.json").write_text(json.dumps({"providers":[provider]}),encoding="utf-8")
+          settings={"noAccountDiscovery":True,"noStats":True,"noUsageStats":True,"noAutoUpdate":True,"noAutoDownload":True,"noWSLAgents":True,"autoRestart":False,"gatewayMode":"on"}
+          (data/"settings.json").write_text(json.dumps(settings),encoding="utf-8")
+          home=root/"home";home.mkdir()
+          env={k:v for k,v in os.environ.items() if not any(x in k.upper() for x in ("TOKEN","SECRET","API_KEY","PASSWORD","CREDENTIAL","AUTHORIZATION"))}
+          env.update({"HOME":str(home),"USERPROFILE":str(home),"APPDATA":str(home/"roaming"),"LOCALAPPDATA":str(home/"local"),"XDG_CONFIG_HOME":str(home/"config"),"XDG_DATA_HOME":str(home/"data"),"MAGPIE_ADDR":"127.0.0.1:23425","NO_COLOR":"1"})
+          def cli(*args):
+              p=subprocess.run([str(bin),*args],cwd=root,env=env,capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=20)
+              need(p.returncode==0,"CLI failed: "+args[0]+" exit="+str(p.returncode))
+              return p.stdout.strip()
+          v=cli("--version")
+          need("0.1.4985" in v,"version mismatch")
+          emit("version_verified",version="0.1.4985")
+          key=cli("gateway-key","issue","--ttl","5m","--name","cloud-fixture","--models",model,"--tokens","4096")
+          need(bool(re.fullmatch(r"[A-Za-z0-9_.-]{16,512}",key)),"invalid local key output")
+          emit("local_key_issued",ttl_seconds=300,upstream_credentials=False)
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs): return None
+          opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+          def call(path,body=None,timeout=5):
+              req=urllib.request.Request("http://127.0.0.1:23425"+path,data=body,headers={"Authorization":"Bearer "+key,"Content-Type":"application/json"})
+              with opener.open(req,timeout=timeout) as r:
+                  need(r.status==200,"unexpected http status")
+                  raw=r.read(1048577)
+                  need(len(raw)<=1048576,"oversize response")
+                  return json.loads(raw)
+          with (root/"gateway.log").open("xb") as log:
+              p=subprocess.Popen([str(bin),"serve"],cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT)
+              try:
+                  deadline=time.monotonic()+35
+                  while True:
+                      need(p.poll() is None,"gateway exited before ready")
+                      lines=subprocess.check_output(["netstat","-ano","-p","tcp"],text=True,errors="replace")
+                      rows=[l.split() for l in lines.splitlines() if "LISTENING" in l and re.search(r":23425\s",l)]
+                      if rows:
+                          need(all(row[1]=="127.0.0.1:23425" and row[-1]==str(p.pid) for row in rows),"listener mismatch")
+                          break
+                      need(time.monotonic()<deadline,"gateway listener timeout")
+                      time.sleep(1)
+                  emit("gateway_ready",loopback=True,pid=p.pid)
+                  listing=call("/v1/models")
+                  ids=[x["id"] for x in listing["data"]]
+                  need(model in ids,"configured free model unavailable")
+                  emit("model_available",requested_model=model)
+                  payload={"model":model,"messages":[{"role":"user","content":"Synthetic engineering fixture. Write Python source for exactly one function batches(items, limit), returning the number of batches needed for nonnegative items and positive limit (zero items means zero). Use one return expression, integer arithmetic only, no imports or calls. Return ONLY JSON with keys code and plan. plan must be an array of three strings: validate_inputs, calculate_batches, verify_boundary_cases, in that order. No markdown."}],"stream":False,"max_tokens":512,"temperature":0}
+                  raw=json.dumps(payload,separators=(",",":")).encode()
+                  intent={"sha256":hashlib.sha256(raw).hexdigest(),"model":model,"post_limit":1,"run_id":os.environ.get("GITHUB_RUN_ID")}
+                  with (root/"dispatch-intent.json").open("x",encoding="utf-8") as f:
+                      json.dump(intent,f);f.flush();os.fsync(f.fileno())
+                  emit("dispatch_intent",**intent)
+                  t=time.monotonic()
+                  try:
+                      reply=call("/v1/chat/completions",raw,timeout=90)
+                  except urllib.error.HTTPError as e:
+                      emit("http_error",status=e.code,automatic_retry=False)
+                      raise RuntimeError("inference HTTP rejection") from None
+                  choice=reply["choices"][0]
+                  answer=json.loads(choice["message"]["content"])
+                  need(choice.get("finish_reason")=="stop" and not choice["message"].get("tool_calls"),"terminal status invalid")
+                  need(type(answer) is dict and set(answer)=={"code","plan"},"response contract")
+                  need(answer["plan"]==["validate_inputs","calculate_batches","verify_boundary_cases"],"plan mismatch")
+                  code=answer["code"]
+                  need(type(code) is str and len(code)<=500,"code size")
+                  tree=ast.parse(code)
+                  need(len(tree.body)==1 and type(tree.body[0]) is ast.FunctionDef,"function only")
+                  fn=tree.body[0]
+                  need(fn.name=="batches" and not fn.decorator_list and fn.returns is None and not fn.type_params if hasattr(fn,"type_params") else fn.name=="batches" and not fn.decorator_list and fn.returns is None,"function contract")
+                  args=fn.args
+                  need([x.arg for x in args.args]==["items","limit"] and all(x.annotation is None for x in args.args) and not (args.posonlyargs or args.kwonlyargs or args.defaults or args.vararg or args.kwarg),"arguments")
+                  need(len(fn.body)==1 and type(fn.body[0]) is ast.Return,"single return")
+                  expr=fn.body[0].value
+                  need(len(list(ast.walk(expr)))<=32,"expression bound")
+                  def evaluate(n,values):
+                      if type(n) is ast.Name and n.id in values: return values[n.id]
+                      if type(n) is ast.Constant and type(n.value) is int and abs(n.value)<=32: return n.value
+                      if type(n) is ast.BinOp:
+                          x,y=evaluate(n.left,values),evaluate(n.right,values)
+                          if type(n.op) is ast.Add: return x+y
+                          if type(n.op) is ast.Sub: return x-y
+                          if type(n.op) is ast.Mult: return x*y
+                          if type(n.op) is ast.FloorDiv: return x//y
+                          if type(n.op) is ast.Mod: return x%y
+                      raise ValueError("unsupported expression")
+                  vectors=[(0,1),(0,12),(1,1),(1,7),(7,7),(8,7),(13,7),(14,7),(15,7),(100,9),(1000,1),(1001,100)]
+                  checks=[evaluate(expr,{"items":i,"limit":l})==((i+l-1)//l) for i,l in vectors]
+                  need(all(checks),"boundary vector failed")
+                  reported=reply.get("model","")
+                  emit("engineering_result",duration_s=round(time.monotonic()-t,3),reported_model=reported if isinstance(reported,str) and re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}",reported) else "unverified",plan=answer["plan"],code=code,vectors_passed=sum(checks),vectors_total=len(vectors),reply_sha256=hashlib.sha256(json.dumps(reply,sort_keys=True).encode()).hexdigest(),client_posts=1,concrete_upstream_model_verified=False)
+                  emit("PASS",scope="synthetic plan and AST-interpreted arithmetic; no arbitrary code execution or production integration")
+              finally:
+                  if p.poll() is None:
+                      p.terminate()
+                      p.wait(timeout=15)
+                  emit("owned_process_stopped",exit_code=p.returncode)
+          
+          '@
+          $path = Join-Path $env:RUNNER_TEMP 'magpie-v161.py'
+          [IO.File]::WriteAllText($path, $script, [Text.UTF8Encoding]::new($false))
+          python $path
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
